@@ -1,0 +1,496 @@
+"""WRO Future Engineers - 障碍赛
+
+只识别柱子，逐根接力：
+
+  SEARCH   直行搜索，看到足够大的柱子就锁定
+  APPROACH 朝它开，把它拉进中心 ROI
+  ORBIT    面积够大时按颜色定角绕过去，绕的同时找下一根
+           绿柱从左侧过 -> 往左打；红柱从右侧过 -> 往右打（规则 9.19）
+
+超声波只用于防撞，不参与循迹。
+"""
+
+# GPIO 后端必须在 import buildhat 之前定好：buildhat 一导入就会用
+# gpiozero 操作 GPIO4 复位 HAT，默认可能挑到 RPi.GPIO 并报
+# "Not running on a RPi!"。pigpio 最省事：
+#   sudo apt install -y pigpio python3-pigpio && sudo systemctl enable --now pigpiod
+import importlib
+import os
+
+
+def init_pin_factory():
+    from gpiozero import Device
+    for label, mod, cls in (
+        ("lgpio", "gpiozero.pins.lgpio", "LGPIOFactory"),
+        ("pigpio", "gpiozero.pins.pigpio", "PiGPIOFactory"),
+        ("native", "gpiozero.pins.native", "NativeFactory"),
+        ("rpigpio", "gpiozero.pins.rpigpio", "RPiGPIOFactory"),
+    ):
+        try:
+            Device.pin_factory = getattr(importlib.import_module(mod), cls)()
+            print(f"GPIO 后端: {label}")
+            return
+        except Exception as exc:
+            print(f"  {label} 不可用: {exc}")
+
+
+init_pin_factory()
+
+from buildhat import Motor, DistanceSensor
+import cv2
+import numpy as np
+import time
+
+
+class SimpleButton:
+    """读一个引脚的高低电平。接法：3.3V(物理17)-660R-按钮-GPIO6(物理31)"""
+
+    def __init__(self, pin, active_high=True, pull="pd"):
+        self.pin, self.active_high = pin, active_high
+        self._req = self._line = self._gz = None
+        errors = []
+        for setup in (self._gpiod, self._gpiozero):
+            try:
+                setup(pull)
+                return
+            except Exception as exc:
+                errors.append(f"{setup.__name__}: {exc}")
+        raise RuntimeError(f"GPIO{pin} 读取失败 -> " + "; ".join(errors))
+
+    def _gpiod(self, pull):
+        import gpiod
+        if hasattr(gpiod, "request_lines"):                    # v2
+            from gpiod.line import Bias, Direction
+            self._req = gpiod.request_lines(
+                "/dev/gpiochip0", consumer="wro",
+                config={self.pin: gpiod.LineSettings(
+                    direction=Direction.INPUT,
+                    bias=Bias.PULL_DOWN if pull == "pd" else Bias.PULL_UP)})
+        else:                                                  # v1
+            line = gpiod.Chip("gpiochip0").get_line(self.pin)
+            flag = (gpiod.LINE_REQ_FLAG_BIAS_PULL_DOWN if pull == "pd"
+                    else gpiod.LINE_REQ_FLAG_BIAS_PULL_UP)
+            try:
+                line.request(consumer="wro",
+                             type=gpiod.LINE_REQ_DIR_IN, flags=flag)
+            except (AttributeError, OSError):
+                line.request(consumer="wro", type=gpiod.LINE_REQ_DIR_IN)
+            self._line = line
+        print("按钮: gpiod")
+
+    def _gpiozero(self, pull):
+        from gpiozero import Button
+        self._gz = Button(self.pin, pull_up=(pull == "pu"), bounce_time=0.05)
+        print("按钮: gpiozero")
+
+    @property
+    def is_pressed(self):
+        if self._req is not None:
+            from gpiod.line import Value
+            level = self._req.get_value(self.pin) == Value.ACTIVE
+        elif self._line is not None:
+            level = bool(self._line.get_value())
+        else:
+            level = bool(self._gz.is_active)
+        return level == self.active_high
+
+
+# =============================================================
+# 【1】速度与转向
+# =============================================================
+SPEED = 15               # 速度绝对值
+REVERSE = -1             # 前进符号，车往后跑就改成 1
+DRIVE_SPEED = REVERSE * SPEED
+MAX_STEER = 30           # 机械极限
+STEER_SLEW = 20          # 每帧转角最大变化量，抑制抖动
+STEER_FLIP = 1           # 左右打反了改成 -1
+
+# =============================================================
+# 【2】面积阈值与动作
+# 面积以 1280 宽为基准，换分辨率自动折算。
+# 实测柱子在 1 米处约 12000，面积与距离成平方反比
+# =============================================================
+AREA_LOCK = 5000         # 大于此值才作为目标（约 1.55m）
+AREA_ORBIT = 60000       # 大于此值开始绕行（约 0.45m）
+AREA_AT_1M = 12000       # 用于估距显示
+
+ALIGN_TOL = 12           # 柱子中心与画面中线相差多少像素内算已对准。
+                         # 只留一个很小的死区，避免持续微抖
+KP_APPROACH = 0.09       # 靠近阶段增益
+
+# 绕行分两段，都用最大打角：
+#   先朝颜色对应的方向摆出去 ORBIT_OUT_TIME 秒，让开柱子
+#   再反方向摆回来，直到看到下一根柱子
+# 回摆阶段才接受新目标——摆出去时被绕的柱子仍在画面里
+ORBIT_OUT_TIME = 0.7     # 摆出去的时长
+ORBIT_MAX_TIME = 3.0     # 整个绕行超过这么久仍未找到下一根就回搜索
+NEXT_CONFIRM = 3         # 连续几帧看到下一根才切换目标
+
+# =============================================================
+# 【3】柱子识别
+# =============================================================
+# 3m 外的柱子多半是隔着场地看到的其他区段，或者噪点，一律丢弃。
+# 面积与距离成平方反比：12000 / 3^2 约等于 1333
+MIN_PILLAR_AREA = 1350   # 约 3.0m
+MAX_PILLAR_AREA = 200000
+MIN_ASPECT = 1.1         # 高宽比下限，排除横着的地面色线
+MIN_FILL = 0.55          # 轮廓占外接矩形比例，排除背景杂色块
+
+GREEN = (np.array([40, 80, 60]), np.array([85, 255, 255]))
+# 红柱色相约 178，橙线约 13，洋红停车块约 150，故拆两段
+RED_LO = (np.array([0, 80, 60]), np.array([8, 255, 255]))
+RED_HI = (np.array([166, 80, 60]), np.array([180, 255, 255]))
+ORBIT_SIGN = {"GREEN": 1, "RED": -1}     # 正 = 左转
+
+# =============================================================
+# 【5】画面与启动
+# =============================================================
+CAPTURE = (640, 480)     # 摄像头原生多为 4:3，要 16:9 会裁切导致视野变窄
+REF_WIDTH = 1280         # 面积基准宽度
+MASK_WIDTH = 240
+
+BUTTON_PIN = 6           # BCM 编号，GPIO6 在物理第 31 脚
+BUTTON_ACTIVE_HIGH = True
+BUTTON_PULL = "pd"
+REQUIRE_BUTTON = True    # 桌面测试可设 False，改按键盘 s 启动
+START_DELAY = 0.5
+STABLE_SAMPLES = 5       # 按钮连续多少次采样一致才认
+
+SHOW_MASKS = False       # 按 M 切换红绿掩膜窗口
+DEBUG_ONLY = False       # True 则不驱动电机，只出画面，用于标定
+LOOP_DT = 0.05
+SHOW_WINDOWS = os.environ.get("WRO_HEADLESS", "0") != "1"
+
+# =============================================================
+# 硬件
+# =============================================================
+steer_motor = Motor("A")
+drive_motor = Motor("D")
+left_sensor = DistanceSensor("B")
+right_sensor = DistanceSensor("C")
+steer_motor.release = False
+
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE[0])
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE[1])
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+
+_ok, _probe = cap.read()
+if not _ok:
+    raise SystemExit("摄像头打不开")
+
+FRAME_H, FRAME_W = _probe.shape[:2]
+AREA_K = (REF_WIDTH / FRAME_W) ** 2
+KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+CX, CY = FRAME_W / 2, FRAME_H / 2
+
+print(f"采集 {FRAME_W}x{FRAME_H}, 面积换算 {AREA_K:.2f}")
+
+
+# =============================================================
+# 工具
+# =============================================================
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+MIN_VALID = 40           # 超声波的最小可测距离，低于此值的读数不可信
+
+
+def read_distance(sensor):
+    """无效读数一律返回 2000。
+    注意 0 表示没收到回波，不是"贴在墙上"——
+    当成极近距离会让防撞持续强推，把方向锁死在一侧"""
+    v = sensor.get_distance()
+    if v is None or v < MIN_VALID:
+        return 2000
+    return int(v)
+
+
+def dist_of(area):
+    """由面积估算距离。面积与距离成平方反比"""
+    return 9999 if area <= 0 else 1000.0 * (AREA_AT_1M / area) ** 0.5
+
+
+def show(name, img):
+    global SHOW_WINDOWS
+    if not SHOW_WINDOWS or img is None or getattr(img, "size", 0) == 0:
+        return
+    try:
+        cv2.imshow(name, img)
+    except cv2.error as exc:
+        print(f"显示不可用，转入无窗口模式: {exc}")
+        SHOW_WINDOWS = False
+
+
+def wait_key(ms):
+    if SHOW_WINDOWS:
+        return cv2.waitKey(ms) & 0xFF
+    time.sleep(ms / 1000.0)
+    return 255
+
+
+_steer_now = None
+
+
+def steer_to(offset):
+    """正 = 左转，负 = 右转。限幅并限制每帧变化率"""
+    global _steer_now
+    goal = clamp(STEER_FLIP * offset, -MAX_STEER, MAX_STEER)
+    pos = round(goal if _steer_now is None else
+                clamp(goal, _steer_now - STEER_SLEW, _steer_now + STEER_SLEW))
+    if pos != _steer_now:
+        if not DEBUG_ONLY:
+            steer_motor.run_to_position(pos, speed=100, blocking=False)
+        _steer_now = pos
+
+
+def drive(speed):
+    if not DEBUG_ONLY:
+        drive_motor.stop() if speed == 0 else drive_motor.start(speed)
+
+
+# =============================================================
+# 识别
+# =============================================================
+def scan(mask, color, out):
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, KERNEL)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, KERNEL)
+    contours, _ = cv2.findContours(
+        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for c in contours:
+        raw = cv2.contourArea(c)
+        area = raw * AREA_K
+        x, y, w, h = cv2.boundingRect(c)
+        if w <= 0 or h <= 0:
+            continue
+        if not MIN_PILLAR_AREA <= area <= MAX_PILLAR_AREA:
+            continue
+        if h / w < MIN_ASPECT or raw / (w * h) < MIN_FILL:
+            continue
+        out.append({"color": color, "area": area, "box": (x, y, w, h),
+                    "cx": x + w / 2, "cy": y + h / 2})
+
+
+def detect(frame):
+    """返回所有柱子（按面积从大到小）与两张掩膜"""
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    red = cv2.bitwise_or(cv2.inRange(hsv, *RED_LO), cv2.inRange(hsv, *RED_HI))
+    green = cv2.inRange(hsv, *GREEN)
+    found = []
+    scan(red, "RED", found)
+    scan(green, "GREEN", found)
+    found.sort(key=lambda p: p["area"], reverse=True)
+    return found, red, green
+
+
+# =============================================================
+# 状态
+# =============================================================
+state = "SEARCH"
+target = None            # 当前锁定的柱子
+orbit_sign = 0
+phase_at = report_at = 0.0
+next_count = 0
+orbits = 0
+
+left_mm = right_mm = 2000
+pillars = []
+
+# =============================================================
+# 等待启动按钮（规则 9.11）
+# =============================================================
+start_button = None
+if REQUIRE_BUTTON:
+    try:
+        start_button = SimpleButton(BUTTON_PIN, BUTTON_ACTIVE_HIGH, BUTTON_PULL)
+        print(f"等待 GPIO{BUTTON_PIN} 按钮 ...")
+    except Exception as exc:
+        print(f"按钮初始化失败: {exc}")
+        print("可 sudo 运行，或在 config.txt 加 gpio=6=ip,pd")
+else:
+    print("按钮已禁用，按 s 启动")
+
+
+def wait_for_press():
+    """先读到稳定的松开，再读到稳定的按下"""
+    released = False
+    press = release = 0
+    last = 0.0
+    while True:
+        ok, frame = cap.read()
+        if ok:
+            cv2.putText(frame, "READY - press start", (30, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
+            show("Camera", frame)
+        if start_button is not None:
+            if start_button.is_pressed:
+                press, release = press + 1, 0
+            else:
+                release, press = release + 1, 0
+            if release >= STABLE_SAMPLES:
+                released = True
+            if released and press >= STABLE_SAMPLES:
+                return
+            if time.time() - last > 1.0:
+                last = time.time()
+                print(f"pin={'HIGH' if start_button.is_pressed else 'LOW'}"
+                      f"{'' if released else '  (等待松开)'}")
+        key = wait_key(30)
+        if key == ord("s"):
+            return
+        if key == ord("q"):
+            cap.release()
+            cv2.destroyAllWindows()
+            raise SystemExit("Aborted")
+
+
+steer_to(0)
+wait_for_press()
+print(f"START in {START_DELAY}s")
+time.sleep(START_DELAY)
+drive(DRIVE_SPEED)
+
+try:
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            continue
+        now = time.time()
+
+        # ---------- 感知 ----------
+        left_mm = read_distance(left_sensor)
+        right_mm = read_distance(right_sensor)
+        pillars, red_mask, green_mask = detect(frame)
+
+        top = pillars[0] if pillars else None
+        usable = top if top and top["area"] >= AREA_LOCK else None
+        report = now - report_at > 1.0
+        if report:
+            report_at = now
+
+        # ---------- SEARCH：直行找柱子 ----------
+        if state == "SEARCH":
+            steer_to(0)
+            if usable:
+                target = usable
+                print(f"LOCK {target['color']} "
+                      f"area={int(target['area'])} "
+                      f"d={dist_of(target['area']):.0f}mm")
+                state = "APPROACH"
+            elif report:
+                print(f"SEARCH n={len(pillars)} "
+                      f"a0={int(top['area']) if top else 0}")
+
+        # ---------- APPROACH：把柱子拉进中心 ROI ----------
+        elif state == "APPROACH":
+            if usable is None:
+                print("TARGET LOST")
+                target = None
+                state = "SEARCH"
+            else:
+                target = usable
+                # 把柱子中心压到画面中线上，一直保持到面积够大
+                dx = target["cx"] - CX
+                out = 0.0 if abs(dx) < ALIGN_TOL else -KP_APPROACH * dx
+                steer_to(out)
+
+                if report:
+                    print(f"APPROACH {target['color']} dx={dx:+.0f} "
+                          f"area={int(target['area'])} "
+                          f"d={dist_of(target['area']):.0f}mm "
+                          f"L={left_mm} R={right_mm} "
+                          f"steer={_steer_now}")
+
+                if target["area"] >= AREA_ORBIT:
+                    orbit_sign = ORBIT_SIGN[target["color"]]
+                    phase_at = now
+                    next_count = 0
+                    print(f"ORBIT {target['color']} "
+                          f"先{'左' if orbit_sign > 0 else '右'}"
+                          f"{ORBIT_OUT_TIME}s 再反向")
+                    state = "ORBIT"
+
+        # ---------- ORBIT：定角绕过去，同时找下一根 ----------
+        elif state == "ORBIT":
+            elapsed = now - phase_at
+            outward = elapsed < ORBIT_OUT_TIME
+            # 先朝颜色对应方向摆出去，再反方向摆回来
+            steer_to((orbit_sign if outward else -orbit_sign) * MAX_STEER)
+
+            # 只认面积最大的那根。回摆时被绕的柱子已经出画面，
+            # 此刻看到的最大柱子就是下一个目标
+            nxt = usable
+            next_count = next_count + 1 if nxt and not outward else 0
+
+            if report:
+                print(f"ORBIT {'外摆' if outward else '回摆'} "
+                      f"{elapsed:.1f}s next="
+                      f"{nxt['color'] if nxt else '--'} "
+                      f"cnt={next_count} steer={_steer_now}")
+
+            if not outward and next_count >= NEXT_CONFIRM:
+                orbits += 1
+                target = nxt
+                print(f"NEXT {nxt['color']} area={int(nxt['area'])} "
+                      f"(已绕 {orbits} 根)")
+                state = "APPROACH"
+            elif elapsed >= ORBIT_MAX_TIME:
+                orbits += 1
+                target = None
+                steer_to(0)
+                print(f"ORBIT 超时，回搜索 (已绕 {orbits} 根)")
+                state = "SEARCH"
+
+        # ---------- 显示 ----------
+        # 画面中线：APPROACH 阶段要把柱子中心压到这条线上
+        cv2.line(frame, (int(CX), 0), (int(CX), FRAME_H), (255, 255, 255), 1)
+        for p in pillars:
+            x, y, w, h = p["box"]
+            c = (0, 0, 255) if p["color"] == "RED" else (0, 255, 0)
+            thick = 3 if target and p["cx"] == target["cx"] else 1
+            cv2.rectangle(frame, (x, y), (x + w, y + h), c, thick)
+            cv2.putText(frame, f"{int(p['area'])}", (x, max(y - 6, 14)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, c, 2)
+        if target:
+            # 柱子中心到中线的水平连线，长度即控制误差
+            ty = int(target["cy"])
+            aligned = abs(target["cx"] - CX) < ALIGN_TOL
+            cv2.line(frame, (int(CX), ty), (int(target["cx"]), ty),
+                     (0, 255, 0) if aligned else (0, 165, 255), 2)
+            cv2.circle(frame, (int(target["cx"]), ty), 5, (255, 255, 255), -1)
+
+        for i, text in enumerate([
+            f"{state}  orbits={orbits}",
+            f"L:{left_mm} R:{right_mm} steer={_steer_now}",
+            f"n={len(pillars)} " + (
+                f"{top['color']} a={int(top['area'])} "
+                f"d={dist_of(top['area']):.0f}mm" if top else "no pillar"),
+        ]):
+            cv2.putText(frame, text, (12, 26 + i * 26),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+        show("Camera", frame)
+        if SHOW_MASKS:
+            show("Red", cv2.resize(red_mask, (MASK_WIDTH, MASK_WIDTH * 3 // 4)))
+            show("Green", cv2.resize(green_mask,
+                                     (MASK_WIDTH, MASK_WIDTH * 3 // 4)))
+
+        key = wait_key(1)
+        if key == ord("m"):
+            SHOW_MASKS = not SHOW_MASKS
+            if not SHOW_MASKS:
+                cv2.destroyWindow("Red")
+                cv2.destroyWindow("Green")
+        elif key == ord("q"):
+            break
+        time.sleep(LOOP_DT)
+
+finally:
+    drive_motor.stop()
+    steer_to(0)
+    cap.release()
+    cv2.destroyAllWindows()
+
+print("Finished")
