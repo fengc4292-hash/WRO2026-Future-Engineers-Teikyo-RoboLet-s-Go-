@@ -1,0 +1,56 @@
+2. Mobility Management
+2.1 Drive and steering
+
+The chassis is built from LEGO SPIKE parts. Two Build HAT motors are used:
+
+Port	Motor	Function
+A	SPIKE L angular motor	Steering (front axle)
+D	SPIKE L angular motor	Drive (rear axle)
+
+The front axle uses an Ackermann steering linkage driven by a single motor. The inner wheel turns through a larger angle than the outer wheel, which reduces tyre scrub in corners. The rear axle is a single shaft driven through a gear train, so both rear wheels always rotate together. This satisfies rule 11.3, which requires the drive wheels to be physically connected and forbids one motor per side.
+
+2.2 Measured geometry
+
+Two numbers determine every steering calculation in the software, so both were measured on the finished vehicle rather than taken from the design:
+
+Quantity	Measured value
+Wheelbase (front axle to rear axle)	135 mm
+Wheel diameter	80 mm
+Maximum steering angle	30°
+
+From these the minimum turning radius follows directly:
+
+R = wheelbase / tan(steering angle) = 135 / tan(30°) ≈ 234 mm
+
+This single figure decides what manoeuvres are physically possible. For example, moving 235 mm sideways while ending parallel to the original heading requires an S-shaped path of two equal opposing arcs, and the forward distance consumed is approximately 2·sqrt(R·Y) ≈ 470 mm — about half a straight section. Knowing this before writing any control code told us how early an avoidance manoeuvre has to begin, and it is the reason the obstacle program starts turning at 0.45 m rather than at the last moment.
+
+2.3 Chassis layout decision
+
+The body was kept short and narrow. Rule 13.1 fixes the corridor width at 1000 mm for the obstacle round, and the traffic signs sit on a fixed lattice of seats inside it. A narrower car leaves more clearance when passing a sign on the required side, and the parking bay in rule 5 is only 200 mm deep, so vehicle width directly limits whether a fully-parallel park is geometrically possible at all. We accepted a slightly less stable platform in exchange for that clearance.
+
+3. Power and Sense Management
+3.1 Power
+
+A 10000 mAh mobile battery feeds a USB Type-C to DC 9 V converter, which powers the Build HAT. The Build HAT in turn supplies the motors and the Raspberry Pi. The output was verified with a multimeter at approximately 9 V under load.
+
+A breadboard consolidates the wiring between the Raspberry Pi and the Build HAT and distributes power and signals to the sensors, the motors, and the start button. Concentrating the connections on one board removed most of the intermittent contact faults we had while the wiring was loose.
+
+3.2 Sensors
+Sensor	Port / pin	Role
+Ultrasonic (left)	Build HAT port B	Distance to left wall
+Ultrasonic (right)	Build HAT port C	Distance to right wall
+USB camera	USB	Colour lines, black walls, traffic signs
+Push button	GPIO6 (physical pin 31)	Start trigger, rule 9.11
+
+Why ultrasonic and not infrared. We first tried an infrared time-of-flight sensor (VL53L0X). The competition walls are matte black and absorb strongly at 940 nm, so the sensor returned usable values only at short range and its error grew severely at mid and long range. Long-distance mode (signal_rate_limit = 0.1, measurement_timing_budget = 200000) improved the situation but did not fix it, and the 200 ms measurement time would have thrown away most of our control loop rate. Ultrasonic sensors are unaffected by surface reflectivity, so we adopted two of them instead and dropped the laser entirely.
+
+Known limitation of the ultrasonic pair. An ultrasonic sensor measures the slant distance to the wall. When the vehicle is not parallel to the wall the reading is inflated by 1/cos(θ) — about 15 % at 30° of yaw — and the error is in the dangerous direction, because the controller believes it has more room than it does. This is why the obstacle program uses the ultrasonic sensors only for display and collision limits, and steers from the camera instead.
+
+3.3 Start button and GPIO backend
+
+Rule 9.11 requires the vehicle to wait in an idle state after power-on until a single start button is pressed. The button is wired between 3.3 V (physical pin 17) through a 660 Ω series resistor to GPIO6 (physical pin 31), using the internal pull-down.
+
+Two software details were needed to make this reliable:
+
+Edge triggering. The program requires five consecutive samples reading released followed by five reading pressed. Level triggering alone caused false starts, because a floating pin registers as pressed the moment the program begins.
+Explicit GPIO backend selection. gpiozero chooses its pin factory automatically and may select RPi.GPIO, which raises Not running on a RPi! on our system. Worse, the buildhat library itself uses gpiozero to reset the HAT over GPIO4 at import time, so the backend has to be fixed before import buildhat. Both programs therefore try lgpio, pigpio, native, and rpigpio in order and install the first one that initialises successfully.
